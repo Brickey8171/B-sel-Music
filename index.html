@@ -70,7 +70,8 @@ const PENT=[0,2,4,7,9];
 const PROG={day:[[0,4,7],[9,12,16],[5,9,12],[7,11,14]], dusk:[[9,12,16],[5,9,12],[0,4,7],[7,11,14]], night:[[9,12,16],[5,9,12],[0,4,7],[4,7,11]]};
 const BPM={day:84,dusk:72,night:56};
 const hz=m=>440*Math.pow(2,(m-69)/12);
-const SR=32000, FIRST_SEC=40, CHUNK_SEC=180, AHEAD=3;
+const SR=22050, FIRST_SEC=30, CHUNK_SEC=150, AHEAD=4;
+const OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
 const session=Math.random().toString(36).slice(2);
 
 let choice='auto';
@@ -81,7 +82,7 @@ const comp={bar:0,step:0,last:72};
 
 async function renderChunk(seconds,startWall,fixedMood,vol){
   const len=Math.ceil((seconds+1.4)*SR);
-  const ctx=new OfflineAudioContext(1,len,SR);
+  const ctx=new OAC(1,len,SR);
   const master=ctx.createGain(), out=ctx.createGain(); out.gain.value=.8*vol;
   const lp=ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=3400;
   const d1=ctx.createDelay(); d1.delayTime.value=.33; const fb=ctx.createGain(); fb.gain.value=.3; const wet=ctx.createGain(); wet.gain.value=.26;
@@ -118,7 +119,7 @@ async function renderChunk(seconds,startWall,fixedMood,vol){
     }
     comp.step++; if(comp.step%8===0) comp.bar++; t+=spb;
   }
-  const buf=await ctx.startRendering();
+  const buf=await new Promise((res,rej)=>{ ctx.oncomplete=e=>res(e.renderedBuffer); try{ const p=ctx.startRendering(); if(p&&p.then) p.then(res,rej); }catch(e){ rej(e); } });
   return {url:URL.createObjectURL(wav(buf.getChannelData(0))),events,moods,dur:len/SR,startWall};
 }
 function wav(f){ const n=f.length, b=new ArrayBuffer(44+n*2), v=new DataView(b); const w=(o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
@@ -141,8 +142,9 @@ async function fill(){
       if(my!==gen){ URL.revokeObjectURL(c.url); break; }
       queue.push(c); plannedEnd=start+c.dur*1000;
       if(on&&!current) playNext();
+      await new Promise(r=>setTimeout(r,250));
     }
-  } finally { busy=false; }
+  } catch(e){ problem(e); } finally { busy=false; }
   if(my!==gen) fill();
 }
 function playNext(){
@@ -174,7 +176,7 @@ const SILENCE=URL.createObjectURL(wav(new Float32Array(SR/4)));
 /* ---------- lock screen / control centre ---------- */
 function mediaSession(){
   if(!('mediaSession' in navigator)) return;
-  const m=current?.moods?.[0]?.mood||moodAt(new Date());
+  const m=(current&&current.moods[0]&&current.moods[0].mood)||moodAt(new Date());
   try{ navigator.mediaSession.metadata=new MediaMetadata({title:{day:'Sunny day',dusk:'Evening',night:'Night'}[m]+' in the village',artist:'Brösel',album:"Brösel's Gramophone",artwork:[{src:artwork(),sizes:'320x320',type:'image/png'}]}); }catch(e){}
   navigator.mediaSession.playbackState=on?'playing':'paused';
 }
@@ -195,14 +197,16 @@ volEl.oninput=()=>{ vol=volEl.value/100; if(nativeVolume) audio.volume=vol; try{
 document.querySelectorAll('.seg button').forEach(b=>b.onclick=()=>{ if(choice===b.dataset.mood) return; choice=b.dataset.mood;
   document.querySelectorAll('.seg button').forEach(x=>x.setAttribute('aria-pressed',x===b)); restartComposition(); ui(); });
 const NAMES={day:'a sunny day tune',dusk:'a slow evening tune',night:'a quiet night tune'};
-function playingMood(){ if(!current) return choice==='auto'?moodAt(new Date()):choice; const t=audio.currentTime; let m=current.moods[0]?.mood; for(const x of current.moods) if(x.t<=t) m=x.mood; return m||'day'; }
+function playingMood(){ if(!current) return choice==='auto'?moodAt(new Date()):choice; const t=audio.currentTime; let m=current.moods[0]&&current.moods[0].mood; for(const x of current.moods) if(x.t<=t) m=x.mood; return m||'day'; }
 let lastUi='';
 function ui(){ playBtn.textContent=on?'■ Stop':'▶ Play'; playBtn.setAttribute('aria-pressed',on);
   const txt=(on?(current?'Playing ':'Tuning up… '):'Ready: ')+NAMES[playingMood()]+(choice==='auto'?' (follows your clock)':'')+'.';
   if(txt!==lastUi){ nowEl.textContent=txt; lastUi=txt; mediaSession(); } }
 setInterval(ui,1500); ui();
-fill();   // compose the first bit right away so Play starts instantly
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'){ fill(); ui(); } });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'){ if(on) fill(); ui(); } });
+function problem(e){ on=false; try{ audio.pause(); }catch(_){} nowEl.textContent='Something went wrong: '+(e&&e.message||e); lastUi=nowEl.textContent; playBtn.textContent='▶ Play'; }
+window.addEventListener('error',e=>problem(e.error||e.message));
+if(!OAC){ playBtn.disabled=true; nowEl.textContent='This browser can’t make Brösel’s music.'; }
 
 /* ---------- pixel scene: Brösel and his gramophone ---------- */
 const cv=document.getElementById('scene'), g=cv.getContext('2d');
@@ -227,7 +231,7 @@ function paint(now,m,playing){
 function draw(now){
   const playing=on&&current&&!audio.paused, m=playingMood();
   paint(now,m,playing);
-  if(playing){ const t=audio.currentTime; if(t<(current.events[seen-1]?.t??-1)) seen=0;
+  if(playing){ const t=audio.currentTime; const prev=current.events[seen-1]; if(prev&&t<prev.t) seen=0;
     while(seen<current.events.length&&current.events[seen].t<=t){ const e=current.events[seen++]; if(t-e.t<.3) notes.push({x:99+(e.m%5)*2,y:26,t:now,c:['#ffffff','#fff2b8','#ffd6e0'][e.m%3],dx:(rnd('d'+e.m+now)-.5)*.4}); } }
   for(let i=notes.length-1;i>=0;i--){ const n=notes[i], age=(now-n.t)/1000; if(age>3){ notes.splice(i,1); continue; }
     const x=n.x+Math.sin(age*3)*3+n.dx*age*20, y=n.y-age*9; g.globalAlpha=Math.max(0,1-age/3);
