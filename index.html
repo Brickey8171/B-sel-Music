@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Brösel's Gramophone</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f3ead8; --card:#fffaf0; --ink:#3b2a20; --soft:#7a6553; --line:#e1d3b9; --accent:#c8743a; --accent-ink:#fff;
+  --sky-day:#9fd3ea; --sky-dusk:#e9a07a; --sky-night:#1d2540;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){ --bg:#161a24; --card:#1f2431; --ink:#efe4d2; --soft:#a99c8a; --line:#323a4c; --accent:#e08a4b; --accent-ink:#1a1206; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,sans-serif}
+body{min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{width:min(440px,100%);background:var(--card);border:2px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 10px 30px rgb(0 0 0/.12)}
+canvas{display:block;width:100%;aspect-ratio:16/9;image-rendering:pixelated;background:var(--sky-day)}
+.body{padding:16px 18px 18px}
+h1{font:600 22px/1.1 "Pixelify Sans",system-ui,sans-serif;margin:0 0 2px}
+.sub{color:var(--soft);font-size:14px;margin:0 0 14px}
+.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+button.play{font:600 17px "Pixelify Sans",system-ui,sans-serif;background:var(--accent);color:var(--accent-ink);border:0;border-radius:10px;padding:10px 18px;cursor:pointer;min-width:120px}
+button.play:focus-visible,.seg button:focus-visible,input:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+label.vol{display:flex;align-items:center;gap:8px;flex:1;min-width:150px;color:var(--soft);font-size:14px}
+input[type=range]{flex:1;accent-color:var(--accent)}
+.seg{display:flex;border:2px solid var(--line);border-radius:10px;overflow:hidden;margin-top:14px}
+.seg button{flex:1;background:none;border:0;color:var(--ink);padding:8px 4px;font:15px "Pixelify Sans",system-ui,sans-serif;cursor:pointer}
+.seg button+button{border-left:2px solid var(--line)}
+.seg button[aria-pressed=true]{background:var(--accent);color:var(--accent-ink)}
+.now{margin:12px 0 0;font-size:14px;color:var(--soft);min-height:1.4em}
+</style>
+</head>
+<body>
+<main class="card">
+  <canvas id="scene" width="160" height="90" aria-hidden="true"></canvas>
+  <div class="body">
+    <h1>Brösel's Gramophone</h1>
+    <p class="sub">The same tune that plays in his village, made up live, so it never repeats exactly.</p>
+    <div class="row">
+      <button class="play" id="play" aria-pressed="false">▶ Play</button>
+      <label class="vol">Volume <input id="vol" type="range" min="0" max="100" value="60"></label>
+    </div>
+    <div class="seg" role="group" aria-label="Time of day">
+      <button data-mood="auto" aria-pressed="true">Clock</button>
+      <button data-mood="day" aria-pressed="false">Day</button>
+      <button data-mood="dusk" aria-pressed="false">Dusk</button>
+      <button data-mood="night" aria-pressed="false">Night</button>
+    </div>
+    <p class="now" id="now"></p>
+  </div>
+</main>
+<script>
+/* ---------- the music engine (same as in Brösel's Village) ---------- */
+function hashStr(s){ let h=2166136261; for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return h>>>0; }
+function rnd(k){ let t=(hashStr(k)+0x6D2B79F5)>>>0; t=Math.imul(t^(t>>>15),t|1); t^=t+Math.imul(t^(t>>>7),t|61); return ((t^(t>>>14))>>>0)/4294967296; }
+const PENT=[0,2,4,7,9];
+const PROG={day:[[0,4,7],[9,12,16],[5,9,12],[7,11,14]], dusk:[[9,12,16],[5,9,12],[0,4,7],[7,11,14]], night:[[9,12,16],[5,9,12],[0,4,7],[4,7,11]]};
+const BPM={day:84,dusk:72,night:56};
+const hz=m=>440*Math.pow(2,(m-69)/12);
+
+let ctx=null, master, out, timer=null, on=false, vol=.6, nextT=0, step=0, bar=0, last=72;
+let choice='auto', mood='day', lastNote=0, lastNoteM=72;
+const session=Math.random().toString(36).slice(2);   // makes every listening session a fresh variation
+
+function clockMood(){ const h=new Date().getHours()+new Date().getMinutes()/60; if(h>=23||h<7) return 'night'; if(h>=17.5||h<8) return 'dusk'; return 'day'; }
+function wantedMood(){ return choice==='auto'?clockMood():choice; }
+
+function build(){
+  ctx=new (window.AudioContext||window.webkitAudioContext)();
+  master=ctx.createGain(); out=ctx.createGain(); out.gain.value=0;
+  const lp=ctx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=3400;
+  const d1=ctx.createDelay(); d1.delayTime.value=.33; const fb=ctx.createGain(); fb.gain.value=.3; const wet=ctx.createGain(); wet.gain.value=.26;
+  master.connect(lp); lp.connect(out); lp.connect(d1); d1.connect(fb); fb.connect(d1); d1.connect(wet); wet.connect(out); out.connect(ctx.destination);
+}
+function tone(freq,t,dur,{type='sine',v=.2,attack=.01,release=.4,detune=0}={}){
+  const o=ctx.createOscillator(), g=ctx.createGain(); o.type=type; o.frequency.value=freq; o.detune.value=detune;
+  g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(v,t+attack); g.gain.exponentialRampToValueAtTime(.0001,t+dur+release);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+release+.05);
+}
+function musicbox(m,t,v){ const f=hz(m); tone(f,t,.05,{v,attack:.004,release:.9}); tone(f*2,t,.02,{v:v*.25,attack:.004,release:.35}); }
+function pad(chord,t,len,v){ for(const n of chord){ tone(hz(48+n),t,len*.6,{type:'triangle',v:v/chord.length,attack:len*.3,release:len*.5,detune:-6}); tone(hz(48+n),t,len*.6,{v:v*.6/chord.length,attack:len*.3,release:len*.5,detune:7}); } }
+
+function schedule(){
+  const spb=60/BPM[mood]/2;
+  while(nextT<ctx.currentTime+.25){
+    const t=nextT, chord=PROG[mood][bar%4], beat=step%8;
+    if(beat===0){
+      mood=wantedMood();
+      pad(chord,t,spb*8,mood==='night'?.09:.11);
+      tone(hz(36+chord[0]),t,spb*3,{v:mood==='night'?.08:.12,attack:.02,release:.6});
+      if(mood!=='night') tone(hz(36+chord[0]+7),t+spb*4,spb*2,{v:.07,attack:.02,release:.5});
+    }
+    const density=mood==='day'?.62:mood==='dusk'?.45:.28;
+    const seed=rnd('mel:'+session+':'+bar+':'+step);
+    if(seed<density&&!(mood==='night'&&beat%2)){
+      const pool=[]; for(const o of [60,72]) for(const s of PENT) pool.push(o+s); pool.push(...chord.map(c=>c+72));
+      const tones=seed<density*.35?chord.map(c=>c+72):(()=>{ const nr=pool.filter(m=>Math.abs(m-last)<=5); return nr.length?nr:pool; })();
+      const m=tones[Math.floor(rnd('n'+session+t.toFixed(3))*tones.length)];
+      last=m; musicbox(m,t,mood==='night'?.07:.1);
+      const delay=(t-ctx.currentTime)*1000; setTimeout(()=>{ lastNote=performance.now(); lastNoteM=m; },Math.max(0,delay));
+    }
+    step++; if(step%8===0) bar++; nextT+=spb;
+  }
+}
+function applyGain(){ if(!ctx) return; out.gain.cancelScheduledValues(ctx.currentTime); out.gain.setTargetAtTime(on?vol*.8:0,ctx.currentTime,.4); }
+async function start(){
+  if(!ctx) build(); if(ctx.state==='suspended') await ctx.resume();
+  on=true; mood=wantedMood(); nextT=ctx.currentTime+.1; clearInterval(timer); timer=setInterval(schedule,90); applyGain(); ui();
+}
+function stop(){ on=false; applyGain(); ui(); setTimeout(()=>{ if(!on){ clearInterval(timer); ctx.suspend(); } },900); }
+
+/* ---------- controls ---------- */
+const playBtn=document.getElementById('play'), volEl=document.getElementById('vol'), nowEl=document.getElementById('now');
+try{ const v=localStorage.getItem('broesel-gramophone-vol'); if(v!==null) volEl.value=v; }catch(e){}
+vol=volEl.value/100;
+playBtn.onclick=()=>on?stop():start();
+volEl.oninput=()=>{ vol=volEl.value/100; applyGain(); try{ localStorage.setItem('broesel-gramophone-vol',volEl.value); }catch(e){} };
+document.querySelectorAll('.seg button').forEach(b=>b.onclick=()=>{ choice=b.dataset.mood; document.querySelectorAll('.seg button').forEach(x=>x.setAttribute('aria-pressed',x===b)); ui(); });
+const NAMES={day:'a sunny day tune',dusk:'a slow evening tune',night:'a quiet night tune'};
+function ui(){ playBtn.textContent=on?'■ Stop':'▶ Play'; playBtn.setAttribute('aria-pressed',on);
+  const m=on?mood:wantedMood(); nowEl.textContent=(on?'Playing ':'Ready: ')+NAMES[m]+(choice==='auto'?' (follows your clock)':'')+'.'; }
+setInterval(ui,2000); ui();
+
+/* ---------- little pixel scene: the gramophone with notes floating up ---------- */
+const cv=document.getElementById('scene'), g=cv.getContext('2d');
+const SKY={day:['#9fd3ea','#cfeaf2'],dusk:['#e9a07a','#f6d1a0'],night:['#1d2540','#33406a']};
+const notes=[]; let seenNote=0;
+function px(x,y,w,h,c){ g.fillStyle=c; g.fillRect(Math.round(x),Math.round(y),w,h); }
+function draw(now){
+  const m=on?mood:wantedMood(), [a,b]=SKY[m];
+  for(let y=0;y<62;y++){ const k=y/62; g.fillStyle=k<.5?a:b; px(0,y,160,1,k<.5?a:b); }
+  if(m==='night'){ for(let i=0;i<22;i++) px(rnd('s'+i)*160|0,rnd('t'+i)*44|0,1,1,(Math.floor(now/600+i)%5)?'#e8e6d0':'#8890b0'); px(128,10,7,7,'#f2ecc8'); px(130,10,5,5,SKY.night[0]); }
+  else px(m==='day'?126:22,m==='day'?10:30,9,9,m==='day'?'#ffe58a':'#ffb46a');
+  px(0,52,160,10,m==='night'?'#26334f':'#7fb36b'); px(0,62,160,28,m==='night'?'#1c2a3a':'#5f9a52');
+  for(let x=0;x<160;x+=6) px(x,61,3,1,m==='night'?'#2c3c56':'#86c070');
+  // table
+  px(60,66,40,4,'#7a5236'); px(64,70,4,14,'#5d3e29'); px(92,70,4,14,'#5d3e29');
+  // gramophone box + turntable
+  px(66,58,26,8,'#9b6a43'); px(66,58,26,1,'#b98457'); px(68,56,22,2,'#3b2a20');
+  const spin=on?Math.floor(now/120)%2:0; px(76+spin*3,56,2,1,'#c9b18a');
+  // horn
+  px(84,48,3,9,'#c79a3c'); px(86,40,4,9,'#d8ae4c'); px(89,32,6,10,'#e3bd5c'); px(94,28,10,14,'#efcd6e'); px(96,31,6,8,'#b88a2e');
+  // Brösel sitting next to it, nodding when music plays
+  const nod=on&&(Math.floor(now/(60000/BPM[m]))%2)?1:0;
+  const hx=34, hy=70+nod;
+  px(hx,hy-6,18,10,'#7a5236'); for(let i=0;i<5;i++) px(hx+1+i*3,hy-8,2,2,'#3b2a20');
+  px(hx+12,hy-3,8,7,'#d9b48a'); px(hx+19,hy,2,2,'#151515'); px(hx+15,hy-1,1,1,'#111'); px(hx+3,hy+4,3,2,'#4a3426'); px(hx+11,hy+4,3,2,'#4a3426');
+  // floating notes
+  if(lastNote!==seenNote&&on){ seenNote=lastNote; notes.push({x:99+(lastNoteM%5)*2,y:26,t:now,c:['#ffffff','#fff2b8','#ffd6e0'][lastNoteM%3],dx:(rnd('d'+lastNoteM+now)-.5)*.4}); }
+  for(let i=notes.length-1;i>=0;i--){ const n=notes[i], age=(now-n.t)/1000; if(age>3){ notes.splice(i,1); continue; }
+    const x=n.x+Math.sin(age*3)*3+n.dx*age*20, y=n.y-age*9; g.globalAlpha=Math.max(0,1-age/3);
+    px(x,y,2,2,n.c); px(x+2,y-5,1,6,n.c); px(x+3,y-5,2,1,n.c); g.globalAlpha=1; }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+document.addEventListener('visibilitychange',()=>{ /* keep playing in background tabs */ });
+</script>
+</body>
+</html>
